@@ -355,6 +355,13 @@ func (r *Route) Resolve(afterResolve func()) (<-chan struct{}, *tcpip.Error) {
 	return ch, err
 }
 
+func (r *Route) nextHop() tcpip.Address {
+	if len(r.NextHop) == 0 {
+		return r.RemoteAddress
+	}
+	return r.NextHop
+}
+
 // local returns true if the route is a local route.
 func (r *Route) local() bool {
 	return r.Loop == PacketLoop || r.outgoingNIC.IsLoopback()
@@ -495,4 +502,13 @@ func (r *Route) isV4Broadcast(addr tcpip.Address) bool {
 func (r *Route) IsOutboundBroadcast() bool {
 	// Only IPv4 has a notion of broadcast.
 	return r.isV4Broadcast(r.RemoteAddress)
+}
+
+// ConfirmReachable informs the network/link layer that the neighbour used for
+// the route is reachable.
+//
+// "Reachable" is defined as having full-duplex communication between the
+// local and remote ends of the route.
+func (r *Route) ConfirmReachable() {
+	r.outgoingNIC.confirmReachable(r.nextHop())
 }
