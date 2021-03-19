@@ -305,7 +305,7 @@ func (e *endpoint) hasTentativeAddr(addr tcpip.Address) bool {
 // dupTentativeAddrDetected removes the tentative address if it exists. If the
 // address was generated via SLAAC, an attempt is made to generate a new
 // address.
-func (e *endpoint) dupTentativeAddrDetected(addr tcpip.Address) *tcpip.Error {
+func (e *endpoint) dupTentativeAddrDetected(addr tcpip.Address, nonce []byte) *tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -318,27 +318,44 @@ func (e *endpoint) dupTentativeAddrDetected(addr tcpip.Address) *tcpip.Error {
 		return tcpip.ErrInvalidEndpointState
 	}
 
-	// If the address is a SLAAC address, do not invalidate its SLAAC prefix as an
-	// attempt will be made to generate a new address for it.
-	if err := e.removePermanentEndpointLocked(addressEndpoint, false /* allowSLAACInvalidation */); err != nil {
-		return err
-	}
+	switch result := e.mu.ndp.extendIfNonceEqual(addr, nonce); result {
+	case newlyExtended:
+		// The nonce we got back was the same we sent so we know the message
+		// indicating a duplicate address was likely ours so do not consider
+		// the address duplicate here.
+		return nil
+	case alreadyExtended:
+		// See Extended.
+		//
+		// Our DAD message was looped back already.
+		return nil
+	case noDADStateFound:
+		panic(fmt.Sprintf("expected DAD state for tentative address %s", addr))
+	case nonceNotEqual:
+		// If the address is a SLAAC address, do not invalidate its SLAAC prefix as an
+		// attempt will be made to generate a new address for it.
+		if err := e.removePermanentEndpointLocked(addressEndpoint, false /* allowSLAACInvalidation */); err != nil {
+			return err
+		}
 
-	prefix := addressEndpoint.Subnet()
+		prefix := addressEndpoint.Subnet()
 
-	switch t := addressEndpoint.ConfigType(); t {
-	case stack.AddressConfigStatic:
-	case stack.AddressConfigSlaac:
-		e.mu.ndp.regenerateSLAACAddr(prefix)
-	case stack.AddressConfigSlaacTemp:
-		// Do not reset the generation attempts counter for the prefix as the
-		// temporary address is being regenerated in response to a DAD conflict.
-		e.mu.ndp.regenerateTempSLAACAddr(prefix, false /* resetGenAttempts */)
+		switch t := addressEndpoint.ConfigType(); t {
+		case stack.AddressConfigStatic:
+		case stack.AddressConfigSlaac:
+			e.mu.ndp.regenerateSLAACAddr(prefix)
+		case stack.AddressConfigSlaacTemp:
+			// Do not reset the generation attempts counter for the prefix as the
+			// temporary address is being regenerated in response to a DAD conflict.
+			e.mu.ndp.regenerateTempSLAACAddr(prefix, false /* resetGenAttempts */)
+		default:
+			panic(fmt.Sprintf("unrecognized address config type = %d", t))
+		}
+
+		return nil
 	default:
-		panic(fmt.Sprintf("unrecognized address config type = %d", t))
+		panic(fmt.Sprintf("unhandled result = %d", result))
 	}
-
-	return nil
 }
 
 // transitionForwarding transitions the endpoint's forwarding status to

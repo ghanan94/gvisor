@@ -214,6 +214,18 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
 			return
 		}
 
+		var it header.NDPOptionIterator
+		{
+			var err error
+			it, err = ns.Options().Iter(false /* check */)
+			if err != nil {
+				// Options are not valid as per the wire format, silently drop the
+				// packet.
+				received.Invalid.Increment()
+				return
+			}
+		}
+
 		if e.hasTentativeAddr(targetAddr) {
 			// If the target address is tentative and the source of the packet is a
 			// unicast (specified) address, then the source of the packet is
@@ -227,6 +239,22 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
 			// stack know so it can handle such a scenario and do nothing further with
 			// the NS.
 			if srcAddr == header.IPv6Any {
+				var nonce []byte
+				for {
+					opt, done, err := it.Next()
+					if err != nil {
+						received.Invalid.Increment()
+						return
+					}
+					if done {
+						break
+					}
+					if n, ok := opt.(header.NDPNonceOption); ok {
+						nonce = n.Nonce()
+						break
+					}
+				}
+
 				// We would get an error if the address no longer exists or the address
 				// is no longer tentative (DAD resolved between the call to
 				// hasTentativeAddr and this point). Both of these are valid scenarios:
@@ -238,7 +266,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
 				//
 				// TODO(gvisor.dev/issue/4046): Handle the scenario when a duplicate
 				// address is detected for an assigned address.
-				if err := e.dupTentativeAddrDetected(targetAddr); err != nil && err != tcpip.ErrBadAddress && err != tcpip.ErrInvalidEndpointState {
+				if err := e.dupTentativeAddrDetected(targetAddr, nonce); err != nil && err != tcpip.ErrBadAddress && err != tcpip.ErrInvalidEndpointState {
 					panic(fmt.Sprintf("unexpected error handling duplicate tentative address: %s", err))
 				}
 			}
@@ -257,21 +285,10 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
 			return
 		}
 
-		var sourceLinkAddr tcpip.LinkAddress
-		{
-			it, err := ns.Options().Iter(false /* check */)
-			if err != nil {
-				// Options are not valid as per the wire format, silently drop the
-				// packet.
-				received.Invalid.Increment()
-				return
-			}
-
-			sourceLinkAddr, ok = getSourceLinkAddr(it)
-			if !ok {
-				received.Invalid.Increment()
-				return
-			}
+		sourceLinkAddr, ok := getSourceLinkAddr(it)
+		if !ok {
+			received.Invalid.Increment()
+			return
 		}
 
 		// As per RFC 4861 section 4.3, the Source Link-Layer Address Option MUST
@@ -398,6 +415,10 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
 		na := header.NDPNeighborAdvert(payload.ToView())
 		targetAddr := na.TargetAddress()
 		if e.hasTentativeAddr(targetAddr) {
+			// We only send a nonce value in DAD messages to check for loopedback
+			// messages so we use the empty nonce value here.
+			var nonce []byte
+
 			// We just got an NA from a node that owns an address we are performing
 			// DAD on, implying the address is not unique. In this case we let the
 			// stack know so it can handle such a scenario and do nothing furthur with
@@ -414,7 +435,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool) {
 			//
 			// TODO(gvisor.dev/issue/4046): Handle the scenario when a duplicate
 			// address is detected for an assigned address.
-			if err := e.dupTentativeAddrDetected(targetAddr); err != nil && err != tcpip.ErrBadAddress && err != tcpip.ErrInvalidEndpointState {
+			if err := e.dupTentativeAddrDetected(targetAddr, nonce); err != nil && err != tcpip.ErrBadAddress && err != tcpip.ErrInvalidEndpointState {
 				panic(fmt.Sprintf("unexpected error handling duplicate tentative address: %s", err))
 			}
 			return

@@ -15,7 +15,9 @@
 package ipv6
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"time"
@@ -498,17 +500,28 @@ type ndpState struct {
 	temporaryAddressDesyncFactor time.Duration
 }
 
+type extendRequest int
+
+const (
+	notRequested extendRequest = iota
+	requested
+	extended
+)
+
 // dadState holds the Duplicate Address Detection timer and channel to signal
 // to the DAD goroutine that DAD should stop.
 type dadState struct {
 	// The DAD timer to send the next NS message, or resolve the address.
-	job *tcpip.Job
+	timer tcpip.Timer
 
 	// Used to let the DAD timer know that it has been stopped.
 	//
 	// Must only be read from or written to while protected by the lock of
 	// the IPv6 endpoint this dadState is associated with.
 	done *bool
+
+	nonce         []byte
+	extendRequest extendRequest
 }
 
 // defaultRouterState holds data associated with a default router discovered by
@@ -608,6 +621,21 @@ type slaacPrefixState struct {
 	maxGenerationAttempts uint8
 }
 
+// NDP options must be 8 octet aligned and the first 2 bytes are used for
+// the type and length fields leaving 6 octets as the minimum size for a
+// nonce option without padding.
+const nonceSize = 6
+
+// As per RFC 7527 section 4.1,
+//
+//   If any probe is looped back within RetransTimer milliseconds after
+//   having sent DupAddrDetectTransmits NS(DAD) messages, the interface
+//   continues with another MAX_MULTICAST_SOLICIT number of NS(DAD)
+//   messages transmitted RetransTimer milliseconds apart.
+//
+// Value taken from RFC 4861 section 10.
+const maxMulticastSolicit = 3
+
 // startDuplicateAddressDetection performs Duplicate Address Detection.
 //
 // This function must only be called by IPv6 addresses that are currently
@@ -651,8 +679,82 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 		return nil
 	}
 
+	// Protected by ndp.ep.mu.
+	done := false
+
 	state := dadState{
-		job: ndp.ep.protocol.stack.NewJob(&ndp.ep.mu, func() {
+		done: &done,
+
+		// We initially start a timer to fire immediately because some of the DAD
+		// work cannot be done while holding the IPv6 endpoint's lock. This is
+		// effectively the same as starting a goroutine but we use a timer that
+		// fires immediately so we can reset it for the next DAD iteration.
+		timer: ndp.ep.protocol.stack.Clock().AfterFunc(0, func() {
+			dadDone := remaining == 0
+
+			nonce, earlyReturn := func() ([]byte, bool) {
+				ndp.ep.mu.Lock()
+				defer ndp.ep.mu.Unlock()
+
+				if done {
+					return nil, true
+				}
+
+				state, ok := ndp.dad[addr]
+				if !ok {
+					panic(fmt.Sprintf("ndpdad: DAD timer fired but missing state for %s on NIC(%d)", addr, ndp.ep.nic.ID()))
+				}
+
+				if addressEndpoint.GetKind() != stack.PermanentTentative {
+					// The endpoint should still be marked as tentative since we are still
+					// performing DAD on it.
+					panic(fmt.Sprintf("ndpdad: addr %s is no longer tentative on NIC(%d)", addr, ndp.ep.nic.ID()))
+				}
+
+				// As per RFC 7527 section 4
+				//
+				//   If any probe is looped back within RetransTimer milliseconds
+				//   after having sent DupAddrDetectTransmits NS(DAD) messages, the
+				//   interface continues with another MAX_MULTICAST_SOLICIT number of
+				//   NS(DAD) messages transmitted RetransTimer milliseconds apart.
+				if dadDone && state.extendRequest == requested {
+					dadDone = false
+					remaining = maxMulticastSolicit
+					state.extendRequest = extended
+				}
+
+				if !dadDone {
+					if state.nonce == nil {
+						state.nonce = make([]byte, nonceSize)
+					}
+
+					if n, err := io.ReadFull(ndp.ep.protocol.stack.SecureRNG(), state.nonce); err != nil {
+						panic(fmt.Sprintf("SecureRNG.Read(...): %s", err))
+					} else if n != len(state.nonce) {
+						panic(fmt.Sprintf("expected to read %d bytes from secure RNG, only read %d bytes", len(state.nonce), n))
+					}
+				}
+
+				ndp.dad[addr] = state
+				return state.nonce, false
+			}()
+			if earlyReturn {
+				return
+			}
+
+			var err *tcpip.Error
+			if !dadDone {
+				err = ndp.sendDADPacket(addr, addressEndpoint, nonce)
+			}
+
+			ndp.ep.mu.Lock()
+			defer ndp.ep.mu.Unlock()
+
+			if done {
+				// DAD was stopped.
+				return
+			}
+
 			state, ok := ndp.dad[addr]
 			if !ok {
 				panic(fmt.Sprintf("ndpdad: DAD timer fired but missing state for %s on NIC(%d)", addr, ndp.ep.nic.ID()))
@@ -664,13 +766,6 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 				panic(fmt.Sprintf("ndpdad: addr %s is no longer tentative on NIC(%d)", addr, ndp.ep.nic.ID()))
 			}
 
-			dadDone := remaining == 0
-
-			var err *tcpip.Error
-			if !dadDone {
-				err = ndp.sendDADPacket(addr, addressEndpoint)
-			}
-
 			if dadDone {
 				// DAD has resolved.
 				addressEndpoint.SetKind(stack.Permanent)
@@ -678,7 +773,7 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 				// DAD is not done and we had no errors when sending the last NDP NS,
 				// schedule the next DAD timer.
 				remaining--
-				state.job.Schedule(ndp.configs.RetransmitTimer)
+				state.timer.Reset(ndp.configs.RetransmitTimer)
 				return
 			}
 
@@ -703,11 +798,6 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 		}),
 	}
 
-	// We initially start a timer to fire immediately because some of the DAD work
-	// cannot be done while holding the IPv6 endpoint's lock. This is effectively
-	// the same as starting a goroutine but we use a timer that fires immediately
-	// so we can reset it for the next DAD iteration.
-	state.job.Schedule(0)
 	ndp.dad[addr] = state
 
 	return nil
@@ -717,13 +807,18 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, addressE
 // addr.
 //
 // addr must be a tentative IPv6 address on ndp's IPv6 endpoint.
-func (ndp *ndpState) sendDADPacket(addr tcpip.Address, addressEndpoint stack.AddressEndpoint) *tcpip.Error {
+func (ndp *ndpState) sendDADPacket(addr tcpip.Address, addressEndpoint stack.AddressEndpoint, nonce []byte) *tcpip.Error {
 	snmc := header.SolicitedNodeAddr(addr)
 
-	icmp := header.ICMPv6(buffer.NewView(header.ICMPv6NeighborSolicitMinimumSize))
+	ser := header.NDPOptionsSerializer{
+		header.NDPNonceOption(nonce),
+	}
+
+	icmp := header.ICMPv6(buffer.NewView(header.ICMPv6NeighborSolicitMinimumSize + ser.Length()))
 	icmp.SetType(header.ICMPv6NeighborSolicit)
 	ns := header.NDPNeighborSolicit(icmp.MessageBody())
 	ns.SetTargetAddress(addr)
+	ns.Options().Serialize(ser)
 	icmp.SetChecksum(header.ICMPv6Checksum(icmp, header.IPv6Any, snmc, buffer.VectorisedView{}))
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -762,13 +857,69 @@ func (ndp *ndpState) stopDuplicateAddressDetection(addr tcpip.Address) {
 		return
 	}
 
-	dad.job.Cancel()
+	dad.timer.Stop()
+	*dad.done = true
 	delete(ndp.dad, addr)
 
 	// Let the integrator know DAD did not resolve.
 	if ndpDisp := ndp.ep.protocol.options.NDPDisp; ndpDisp != nil {
 		ndpDisp.OnDuplicateAddressDetectionStatus(ndp.ep.nic.ID(), addr, false, nil)
 	}
+}
+
+// extendIfNonceEqualDisposition enumerates the possible results from
+// extendIfNonceEqual.
+type extendIfNonceEqualDisposition int
+
+const (
+	// newlyExtended indicates that the DAD process was extended.
+	newlyExtended extendIfNonceEqualDisposition = iota
+
+	// alreadyExtended indicates that the DAD process was already extended.
+	alreadyExtended
+
+	// noDADStateFound indicates that DAD state was not found for the address.
+	noDADStateFound
+
+	// nonceNotEqual indicates that the nonce value passed and the nonce in the
+	// last send DAD message are not equal.
+	nonceNotEqual
+)
+
+// extendIfNonceEqual extends the DAD process if the provided nonce is the
+// same as the nonce sent in the last DAD message.
+//
+// The IPv6 endpoint that ndp belongs to MUST be locked.
+func (ndp *ndpState) extendIfNonceEqual(addr tcpip.Address, nonce []byte) extendIfNonceEqualDisposition {
+	s, ok := ndp.dad[addr]
+	if !ok {
+		return noDADStateFound
+	}
+
+	if s.extendRequest != notRequested {
+		return alreadyExtended
+	}
+
+	// As per RFC 7527 section 4
+	//
+	//   If any probe is looped back within RetransTimer milliseconds after having
+	//   sent DupAddrDetectTransmits NS(DAD) messages, the interface continues
+	//   with another MAX_MULTICAST_SOLICIT number of NS(DAD) messages transmitted
+	//   RetransTimer milliseconds apart.
+	//
+	// If a DAD message has already been sent and the nonce value we observed is
+	// the same as the nonce value we last sent, then we assume our probe was
+	// looped back and request an extension to the DAD process.
+	//
+	// Note, the first DAD message is sent asynchronously so we need to make sure
+	// that we sent a DAD message by checking if we have a nonce value set.
+	if s.nonce != nil && bytes.Equal(s.nonce, nonce) {
+		s.extendRequest = requested
+		ndp.dad[addr] = s
+		return newlyExtended
+	}
+
+	return nonceNotEqual
 }
 
 // handleRA handles a Router Advertisement message that arrived on the NIC

@@ -15,6 +15,7 @@
 package stack_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
@@ -358,6 +360,76 @@ func TestDADDisabled(t *testing.T) {
 	}
 }
 
+func checkGetMainNICAddress(s *stack.Stack, nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, want tcpip.AddressWithPrefix) error {
+	if addr, err := s.GetMainNICAddress(nicID, proto); err != nil {
+		return fmt.Errorf("stack.GetMainNICAddress(%d, %d): %s", nicID, proto, err)
+	} else if addr != want {
+		return fmt.Errorf("got stack.GetMainNICAddress(%d, %d) = %s, want = %s", nicID, proto, addr, want)
+	}
+	return nil
+}
+
+func TestDADResolveLoopback(t *testing.T) {
+	const nicID = 1
+
+	ndpDisp := ndpDispatcher{
+		dadC: make(chan ndpDADEvent, 1),
+	}
+
+	ndpConfigs := ipv6.NDPConfigurations{
+		RetransmitTimer:        time.Second,
+		DupAddrDetectTransmits: 1,
+	}
+	clock := faketime.NewManualClock()
+	s := stack.New(stack.Options{
+		Clock: clock,
+		NetworkProtocols: []stack.NetworkProtocolFactory{ipv6.NewProtocolWithOptions(ipv6.Options{
+			NDPDisp:    &ndpDisp,
+			NDPConfigs: ndpConfigs,
+		})},
+	})
+	if err := s.CreateNIC(nicID, loopback.New()); err != nil {
+		t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
+	}
+
+	addrWithPrefix := tcpip.AddressWithPrefix{
+		Address:   addr1,
+		PrefixLen: 64,
+	}
+	if err := s.AddAddressWithPrefix(nicID, header.IPv6ProtocolNumber, addrWithPrefix); err != nil {
+		t.Fatalf("AddAddressWithPrefix(%d, %d, %s) = %s", nicID, header.IPv6ProtocolNumber, addrWithPrefix, err)
+	}
+
+	// Address should not be considered bound to the NIC yet (DAD ongoing).
+	if err := checkGetMainNICAddress(s, nicID, header.IPv6ProtocolNumber, tcpip.AddressWithPrefix{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// DAD should not resolve after the normal resolution time since our DAD
+	// message was looped back - we should extend our DAD process.
+	dadResolutionTime := time.Duration(ndpConfigs.DupAddrDetectTransmits) * ndpConfigs.RetransmitTimer
+	clock.Advance(dadResolutionTime)
+	if err := checkGetMainNICAddress(s, nicID, header.IPv6ProtocolNumber, tcpip.AddressWithPrefix{}); err != nil {
+		t.Error(err)
+	}
+
+	// Make sure the address does not resolve before the extended resolution time
+	// has passed.
+	const delta = time.Nanosecond
+	// DAD will send extra NS probes if an NS message is looped back.
+	const extraTransmits = 3
+	clock.Advance(dadResolutionTime*extraTransmits - delta)
+	if err := checkGetMainNICAddress(s, nicID, header.IPv6ProtocolNumber, tcpip.AddressWithPrefix{}); err != nil {
+		t.Error(err)
+	}
+
+	// DAD should now resolve.
+	clock.Advance(delta)
+	if diff := checkDADEvent(<-ndpDisp.dadC, nicID, addr1, true, nil); diff != "" {
+		t.Errorf("DAD event mismatch (-want +got):\n%s", diff)
+	}
+}
+
 // TestDADResolve tests that an address successfully resolves after performing
 // DAD for various values of DupAddrDetectTransmits and RetransmitTimer.
 // Included in the subtests is a test to make sure that an invalid
@@ -404,6 +476,16 @@ func TestDADResolve(t *testing.T) {
 		},
 	}
 
+	nonces := [][]byte{
+		{1, 2, 3, 4, 5, 6},
+		{7, 8, 9, 10, 11, 12},
+	}
+
+	var secureRNGBytes []byte
+	for _, n := range nonces {
+		secureRNGBytes = append(secureRNGBytes, n...)
+	}
+
 	for _, test := range tests {
 		test := test
 
@@ -419,7 +501,12 @@ func TestDADResolve(t *testing.T) {
 				headerLength: test.linkHeaderLen,
 			}
 			e.Endpoint.LinkEPCapabilities |= stack.CapabilityResolutionRequired
+
+			var secureRNG bytes.Reader
+			secureRNG.Reset(secureRNGBytes)
+
 			s := stack.New(stack.Options{
+				SecureRNG: &secureRNG,
 				NetworkProtocols: []stack.NetworkProtocolFactory{ipv6.NewProtocolWithOptions(ipv6.Options{
 					NDPDisp: &ndpDisp,
 					NDPConfigs: ipv6.NDPConfigurations{
@@ -555,7 +642,7 @@ func TestDADResolve(t *testing.T) {
 					checker.TTL(header.NDPHopLimit),
 					checker.NDPNS(
 						checker.NDPNSTargetAddress(addr1),
-						checker.NDPNSOptions(nil),
+						checker.NDPNSOptions([]header.NDPOption{header.NDPNonceOption(nonces[i])}),
 					))
 
 				if l, want := p.Pkt.AvailableHeaderBytes(), int(test.linkHeaderLen); l != want {
